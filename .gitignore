@@ -2,6 +2,11 @@
 build/
 outputs/
 
+# Project documentation (local only, not tracked)
+paper-notes.tex
+fortran-paradigms-guide.md
+coding_standards.md
+
 # IDE / editor
 .vscode/
 .idea/
