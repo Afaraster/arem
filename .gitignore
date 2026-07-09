@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# FPM / Fortran
+*.mod
+*.o
+*.a
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# OS
+.DS_Store
+Thumbs.db

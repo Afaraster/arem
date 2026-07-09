@@ -1,0 +1,26 @@
+name = "arem"
+version = "0.1.0"
+license = "license"
+author = "Afaraster"
+maintainer = "hnsmtw@outlook.com"
+copyright = "Copyright 2026, Afaraster"
+
+[build]
+auto-executables = true
+auto-tests = true
+auto-examples = true
+module-naming = false
+
+[install]
+library = false
+test = false
+
+[dependencies]
+# stdlib = "*"
+blas = "*"
+openmp = "*"
+
+[fortran]
+implicit-typing = false
+implicit-external = false
+source-form = "free"
