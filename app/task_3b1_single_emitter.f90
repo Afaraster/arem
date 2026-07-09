@@ -2,8 +2,8 @@
 !>
 !> Places one emitter at [191, 191] (off-grid for Delta = 20 m),
 !> runs AREM, verifies that F(theta) = -H(theta) attains its maximum
-!> at the true emitter location, and outputs F(theta) over a dense
-!> 2D patch for 3D visualization.
+!> at the true emitter location, and outputs F(theta) surfaces for
+!> 3D and 2D visualization.
 program task_3b1_single_emitter
     use mod_precision, only: wp
     use mod_constants, only: PI
@@ -12,9 +12,10 @@ program task_3b1_single_emitter
     use mod_preprocess, only: compute_preprocessing
     use mod_arem, only: arem_solve
     use mod_simulation, only: create_grid, generate_sensors, &
-        generate_measurements
+                                generate_measurements
     use mod_gradient, only: compute_H
-    use mod_io, only: write_array_2d, write_vector, ensure_output_dir
+    use mod_io, only: write_vector, ensure_output_dir
+    use stdlib_io_npy, only: save_npy
     implicit none
 
     ! --- Parameters ---
@@ -34,10 +35,14 @@ program task_3b1_single_emitter
     type(arem_config)  :: config
     type(arem_result)  :: result
     real(wp), allocatable :: z(:), A_grid(:, :), T(:, :), Aprime(:, :)
-    real(wp), allocatable :: F_values(:, :)
-    integer :: i, j, idx, nx_patch, ny_patch
-    real(wp) :: x, y, F_val
-    type(grid_spec) :: patch_grid
+    real(wp), allocatable :: F_full(:, :), F_local(:, :)
+    real(wp), allocatable :: gamma_prime(:), corr(:)
+    real(wp), allocatable :: A_Tk_patch(:, :), support_pos(:, :)
+    integer  :: i, j, idx_max, nx_full, ny_full, nx_local, ny_local
+    real(wp) :: x, y, F_val, rough_x, rough_y, refined_x, refined_y
+    real(wp), parameter :: FULL_DELTA  = 10.0_wp  ! 10 m spacing for full ROI
+    real(wp), parameter :: LOCAL_DELTA = 1.0_wp   ! 1 m spacing for local patch
+    real(wp), parameter :: LOCAL_HALF  = 30.0_wp  ! half-width of local patch
 
     ! --- Initialization ---
     call ensure_output_dir()
@@ -46,7 +51,7 @@ program task_3b1_single_emitter
     ! Create grid
     call create_grid(0.0_wp, ROI_SIZE, 0.0_wp, ROI_SIZE, DELTA, grid)
     write (*, "(A, I0, A, I0, A, I0)") "Grid: ", grid%nx, " x ", grid%ny, &
-        " = ", grid%N, " points"
+                                         " = ", grid%N, " points"
 
     ! Generate sensors (deterministic seed)
     call generate_sensors(0.0_wp, ROI_SIZE, 0.0_wp, ROI_SIZE, M, 42, sensors)
@@ -64,22 +69,32 @@ program task_3b1_single_emitter
     ! Generate noiseless measurements
     allocate (z(M))
     call generate_measurements(sensors, emitters, D0, ETA, &
-                               0.0_wp, 0.0_wp, 123, z)
+                                0.0_wp, 0.0_wp, 123, z)
     write (*, "(A, ES12.5)") "||z||_2 = ", norm2(z)
 
     ! Build full dictionary and preprocessing
     A_grid = build_path_loss_dictionary(sensors%positions, grid, D0, ETA)
     write (*, "(A, I0, A, I0)") "Dictionary A: ", size(A_grid, 1), &
-        " x ", size(A_grid, 2)
+                                 " x ", size(A_grid, 2)
 
     call compute_preprocessing(A_grid, T, Aprime)
     write (*, "(A)") "Preprocessing T and A'' computed."
+
+    ! --- Rough estimate (Eq. 15) ---
+    allocate (gamma_prime(size(T, 1)))
+    allocate (corr(grid%N))
+    gamma_prime = matmul(T, z)
+    corr = abs(matmul(transpose(Aprime), gamma_prime))
+    idx_max = maxloc(corr, dim=1)
+    rough_x = grid%points(idx_max, 1)
+    rough_y = grid%points(idx_max, 2)
+    write (*, "(A, F7.1, A, F7.1)") "Rough estimate: ", rough_x, ", ", rough_y
 
     ! --- Run AREM ---
     config%eta = ETA
     config%d0 = D0
     config%th_error = 1e-10_wp
-    config%alpha = 0.5_wp
+    config%alpha = 1.0_wp
     config%max_outer_iter = 3
     config%max_inner_iter = 200
     config%prune_threshold = 1e-6_wp
@@ -91,77 +106,107 @@ program task_3b1_single_emitter
     write (*, "(A, L1)") "Converged: ", result%converged
 
     if (result%n_found > 0) then
-        write (*, "(A, F10.2, A, F10.2)") "Estimated position: ", &
-            result%positions(1, 1), ", ", result%positions(1, 2)
+        refined_x = result%positions(1, 1)
+        refined_y = result%positions(1, 2)
+        write (*, "(A, F10.2, A, F10.2)") "Refined position:  ", refined_x, ", ", refined_y
         write (*, "(A, F10.6)") "Estimated power: ", result%powers(1)
         write (*, "(A, F10.4)") "Position error [m]: ", &
             norm2(result%positions(1, :) - [EMITTER_X, EMITTER_Y])
+    else
+        refined_x = rough_x
+        refined_y = rough_y
     end if
 
-    ! --- Compute F(theta) = -H(theta) over a dense patch around the emitter ---
-    ! Patch: 40x40 m around emitter, 1 m resolution
-    nx_patch = 41; ny_patch = 41
-    allocate (F_values(nx_patch, ny_patch))
+    ! --- Save position data for plotting ---
+    block
+        real(wp) :: pos_data(6)
+        pos_data = [EMITTER_X, EMITTER_Y, rough_x, rough_y, refined_x, refined_y]
+        call write_vector("task_3b1_positions.dat", pos_data)
+    end block
 
-    write (*, "(A)") "Computing F(theta) surface..."
-    do j = 1, ny_patch
-        y = EMITTER_Y - 20.0_wp + (j - 1) * 1.0_wp
-        do i = 1, nx_patch
-            x = EMITTER_X - 20.0_wp + (i - 1) * 1.0_wp
+    allocate (support_pos(1, 2))
 
-            ! Build A_Tk for this single position
-            block
-                real(wp), allocatable :: A_Tk(:, :), support_pos(:, :)
-                allocate (support_pos(1, 2))
-                support_pos(1, 1) = x
-                support_pos(1, 2) = y
-                A_Tk = build_A_Tk_patch(sensors%positions, support_pos, D0, ETA)
-                F_val = -compute_H(z, A_Tk)
-            end block
+    ! --- Compute F(theta) over the FULL ROI at 10 m spacing ---
+    nx_full = nint(ROI_SIZE / FULL_DELTA) + 1  ! 41
+    ny_full = nint(ROI_SIZE / FULL_DELTA) + 1
+    allocate (F_full(nx_full, ny_full))
+    allocate (A_Tk_patch(M, 1))
 
-            F_values(i, j) = F_val
+    write (*, "(A, I0, A, I0, A)") "Computing F(theta) over full ROI (", &
+        nx_full, " x ", ny_full, ")..."
+    do j = 1, ny_full
+        y = (j - 1) * FULL_DELTA
+        do i = 1, nx_full
+            x = (i - 1) * FULL_DELTA
+            support_pos(1, 1) = x
+            support_pos(1, 2) = y
+            A_Tk_patch = build_A_Tk_scan(sensors%positions, support_pos, D0, ETA)
+            F_full(i, j) = -compute_H(z, A_Tk_patch)
         end do
     end do
 
-    ! Write F(theta) surface data
-    call write_array_2d("task_3b1_F_surface.dat", F_values)
-    write (*, "(A)") "F(theta) surface written to outputs/task_3b1_F_surface.dat"
+    call save_npy("outputs/task_3b1_F_full.npy", F_full)
+    write (*, "(A)") "Full-ROI F(theta) saved to outputs/task_3b1_F_full.npy"
 
-    ! Write patch metadata
+    ! Save full-ROI metadata: x_min, x_max, y_min, y_max
     block
-        real(wp) :: meta(4)
-        meta = [EMITTER_X - 20.0_wp, EMITTER_X + 20.0_wp, &
-                EMITTER_Y - 20.0_wp, EMITTER_Y + 20.0_wp]
-        call write_vector("task_3b1_patch_bounds.dat", meta)
+        real(wp) :: full_meta(4)
+        full_meta = [0.0_wp, ROI_SIZE, 0.0_wp, ROI_SIZE]
+        call write_vector("task_3b1_full_meta.dat", full_meta)
+    end block
+
+    ! --- Compute F(theta) over LOCAL patch at 1 m spacing ---
+    nx_local = nint(2.0_wp * LOCAL_HALF / LOCAL_DELTA) + 1  ! 61
+    ny_local = nint(2.0_wp * LOCAL_HALF / LOCAL_DELTA) + 1
+    allocate (F_local(nx_local, ny_local))
+
+    write (*, "(A, I0, A, I0, A)") "Computing F(theta) over local patch (", &
+        nx_local, " x ", ny_local, ")..."
+    do j = 1, ny_local
+        y = EMITTER_Y - LOCAL_HALF + (j - 1) * LOCAL_DELTA
+        do i = 1, nx_local
+            x = EMITTER_X - LOCAL_HALF + (i - 1) * LOCAL_DELTA
+            support_pos(1, 1) = x
+            support_pos(1, 2) = y
+            A_Tk_patch = build_A_Tk_scan(sensors%positions, support_pos, D0, ETA)
+            F_local(i, j) = -compute_H(z, A_Tk_patch)
+        end do
+    end do
+
+    call save_npy("outputs/task_3b1_F_local.npy", F_local)
+    write (*, "(A)") "Local-patch F(theta) saved to outputs/task_3b1_F_local.npy"
+
+    ! Save local-patch metadata
+    block
+        real(wp) :: local_meta(4)
+        local_meta = [EMITTER_X - LOCAL_HALF, EMITTER_X + LOCAL_HALF, &
+                      EMITTER_Y - LOCAL_HALF, EMITTER_Y + LOCAL_HALF]
+        call write_vector("task_3b1_local_meta.dat", local_meta)
     end block
 
     write (*, "(A)") "=== Task 3-B.1 complete ==="
 
 contains
 
-    !> Build a support dictionary for a given set of positions.
-    !> (Local copy to avoid circular module dependencies in the driver.)
-    function build_A_Tk_patch(sens, supp, d0_loc, eta_loc) result(A_Tk)
+    !> Build a single-column dictionary for F(theta) scanning.
+    function build_A_Tk_scan(sens, supp, d0_loc, eta_loc) result(A_Tk)
         real(wp), intent(in) :: sens(:, :)
         real(wp), intent(in) :: supp(:, :)
         real(wp), intent(in) :: d0_loc, eta_loc
         real(wp), allocatable :: A_Tk(:, :)
 
-        integer  :: ii, mm, M_sens, n_supp
+        integer  :: mm, M_sens
         real(wp) :: dx, dy, dist
 
         M_sens = size(sens, 1)
-        n_supp = size(supp, 1)
-        allocate (A_Tk(M_sens, n_supp))
+        allocate (A_Tk(M_sens, 1))
 
-        do ii = 1, n_supp
-            do mm = 1, M_sens
-                dx = sens(mm, 1) - supp(ii, 1)
-                dy = sens(mm, 2) - supp(ii, 2)
-                dist = sqrt(dx**2 + dy**2)
-                A_Tk(mm, ii) = path_loss(dist, d0_loc, eta_loc)
-            end do
+        do mm = 1, M_sens
+            dx = sens(mm, 1) - supp(1, 1)
+            dy = sens(mm, 2) - supp(1, 2)
+            dist = sqrt(dx**2 + dy**2)
+            A_Tk(mm, 1) = path_loss(dist, d0_loc, eta_loc)
         end do
-    end function build_A_Tk_patch
+    end function build_A_Tk_scan
 
 end program task_3b1_single_emitter

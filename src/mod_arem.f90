@@ -119,17 +119,24 @@ contains
 
                 ! Step 3: Gradient descent update of emitter positions
                 allocate (grad(n_support, 2))
-                call compute_gradient(z, A_Tk, sensors, support_pos, &
+                call compute_gradient(z, A_Tk, omega, sensors, support_pos, &
                                       config%eta, config%d0, grad)
 
-                ! Gradient step: theta ← theta - alpha * grad_H^T
-                ! Note: grad has shape [n_support, 2], where grad(i,1)=∂H/∂x,
-                ! grad(i,2)=∂H/∂y. We step in the negative gradient direction.
+                ! Normalized gradient descent (Fix 2):
+                ! Raw gradient scales with RSS magnitude (~0.1), causing
+                ! premature convergence. Normalize to unit direction so
+                ! the step size controls the spatial displacement directly.
                 do i = 1, n_support
-                    support_pos(i, 1) = support_pos(i, 1) &
-                        - alpha * grad(i, 1)
-                    support_pos(i, 2) = support_pos(i, 2) &
-                        - alpha * grad(i, 2)
+                    block
+                        real(wp) :: gnorm
+                        gnorm = norm2(grad(i, :))
+                        if (gnorm > 1e-15_wp) then
+                            support_pos(i, 1) = support_pos(i, 1) &
+                                - alpha * grad(i, 1) / gnorm
+                            support_pos(i, 2) = support_pos(i, 2) &
+                                - alpha * grad(i, 2) / gnorm
+                        end if
+                    end block
                 end do
                 deallocate (grad)
 
